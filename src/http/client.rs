@@ -69,6 +69,7 @@ pub struct Configuration<'a> {
     pub follow_redirects_policy: FollowRedirectsPolicy,
     pub client_cert_pem: Option<&'a str>,
     pub client_key_pem: Option<&'a str>,
+    pub server_cert_pem: Option<&'a str>,
 
     pub use_global_ca_store: bool,
     #[cfg(not(esp_idf_version = "4.3"))]
@@ -94,6 +95,7 @@ pub struct EspHttpConnection {
     content_len_header: UnsafeCell<Option<Option<String>>>,
     _client_cert_pem: Option<CString>,
     _client_key_pem: Option<CString>,
+    _server_cert_pem: Option<CString>,
 }
 
 impl EspHttpConnection {
@@ -101,6 +103,7 @@ impl EspHttpConnection {
         let event_handler = Box::new(None);
         let mut client_cert_pem: Option<CString> = None;
         let mut client_key_pem: Option<CString> = None;
+        let mut server_cert_pem: Option<CString> = None;
 
         let mut native_config = esp_http_client_config_t {
             // The ESP-IDF HTTP client is really picky on being initialized with a valid URL
@@ -140,6 +143,15 @@ impl EspHttpConnection {
             native_config.client_key_len = 0;
         }
 
+        if let (Some(cert)) = configuration.server_cert_pem {
+            // Convert server cert to CString
+            server_cert_pem = Some(CString::new(cert).unwrap());
+
+            // Sets pointer for server cert
+            native_config.cert_pem = server_cert_pem.as_ref().unwrap().as_ptr();
+            native_config.cert_len = 0;
+        }
+
         let raw_client = unsafe { esp_http_client_init(&native_config) };
         if raw_client.is_null() {
             Err(EspError::from(ESP_FAIL).unwrap())
@@ -155,6 +167,7 @@ impl EspHttpConnection {
                 content_len_header: UnsafeCell::new(None),
                 _client_cert_pem: client_cert_pem,
                 _client_key_pem: client_key_pem,
+                _server_cert_pem: server_cert_pem
             })
         }
     }
