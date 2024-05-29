@@ -276,7 +276,7 @@ impl EspOta {
         Ok(())
     }
 
-    pub fn initiate_update(&mut self) -> Result<EspOtaUpdate<'_>, EspError> {
+    pub fn initiate_update(&mut self, size: usize) -> Result<EspOtaUpdate<'_>, EspError> {
         // This might return a null pointer in case no valid partition can be found.
         // We don't have to handle this error in here, as this will implicitly trigger an error
         // as soon as the null pointer is provided to `esp_ota_begin`.
@@ -284,7 +284,7 @@ impl EspOta {
 
         let mut handle: esp_ota_handle_t = Default::default();
 
-        esp!(unsafe { esp_ota_begin(partition, OTA_SIZE_UNKNOWN as usize, &mut handle) })?;
+        esp!(unsafe { esp_ota_begin(partition, size, &mut handle) })?;
 
         Ok(EspOtaUpdate {
             update_partition: partition,
@@ -416,7 +416,7 @@ impl Ota for EspOta {
     }
 
     fn initiate_update(&mut self) -> Result<Self::Update<'_>, Self::Error> {
-        EspOta::initiate_update(self).map_err(EspIOError)
+        EspOta::initiate_update(self, OTA_SIZE_UNKNOWN as usize).map_err(EspIOError)
     }
 
     fn mark_running_slot_valid(&mut self) -> Result<(), Self::Error> {

@@ -81,6 +81,10 @@ pub struct Configuration {
     pub buffer_size_tx: Option<usize>,
     pub timeout: Option<core::time::Duration>,
     pub follow_redirects_policy: FollowRedirectsPolicy,
+    pub keep_alive_enable: bool,
+    pub keep_alive_idle: i32,
+    pub keep_alive_interval: i32,
+    pub keep_alive_count: i32,
     pub client_certificate: Option<X509<'static>>,
     pub private_key: Option<X509<'static>>,
     pub use_global_ca_store: bool,
@@ -122,8 +126,10 @@ impl EspHttpConnection {
 
             use_global_ca_store: configuration.use_global_ca_store,
             #[cfg(not(esp_idf_version = "4.3"))]
-            crt_bundle_attach: configuration.crt_bundle_attach,
-
+            keep_alive_enable: configuration.keep_alive_enable,
+            keep_alive_idle: configuration.keep_alive_idle,
+            keep_alive_interval: configuration.keep_alive_interval,
+            keep_alive_count: configuration.keep_alive_count,
             ..Default::default()
         };
 
@@ -181,21 +187,17 @@ impl EspHttpConnection {
         self.assert_response();
 
         if name.eq_ignore_ascii_case("Content-Length") {
-            if let Some(content_len_opt) =
-                unsafe { self.content_len_header.get().as_mut().unwrap() }.as_ref()
-            {
-                content_len_opt.as_ref().map(|s| s.as_str())
+            let content_len_header = unsafe { &mut *self.content_len_header.get() };
+            if content_len_header.is_some() {
+                return content_len_header.as_ref().and_then(|s| s.as_deref());
+            }
+            let content_len = unsafe { esp_http_client_get_content_length(self.raw_client) };
+            if content_len >= 0 {
+                content_len_header
+                    .insert(Some(content_len.to_string()))
+                    .as_deref()
             } else {
-                let content_len = unsafe { esp_http_client_get_content_length(self.raw_client) };
-                *unsafe { self.content_len_header.get().as_mut().unwrap() } = if content_len >= 0 {
-                    Some(Some(content_len.to_string()))
-                } else {
-                    None
-                };
-
-                unsafe { self.content_len_header.get().as_mut().unwrap() }
-                    .as_ref()
-                    .and_then(|s| s.as_ref().map(|s| s.as_ref()))
+                None
             }
         } else {
             self.headers.get(UncasedStr::new(name)).map(|s| s.as_str())
