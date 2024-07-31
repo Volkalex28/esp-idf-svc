@@ -14,6 +14,9 @@ use enumset::*;
 
 use embedded_svc::wifi::Wifi;
 
+#[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+use esp_idf_hal::task::asynch::Notification;
+
 use crate::hal::modem::WifiModemPeripheral;
 use crate::hal::peripheral::Peripheral;
 
@@ -360,6 +363,9 @@ pub trait NonBlocking {
     fn stop_wps(&mut self) -> Result<WpsStatus, EspError>;
 
     fn is_wps_finished(&self) -> Result<bool, EspError>;
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification>;
 }
 
 impl<T> NonBlocking for &mut T
@@ -404,6 +410,11 @@ where
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         (**self).is_wps_finished()
     }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        (**self).notification()
+    }
 }
 
 /// This struct provides a safe wrapper over the ESP IDF Wifi C driver. The driver
@@ -415,6 +426,8 @@ where
 /// only when one would like to utilize a custom, non-STD network stack like `smoltcp`.
 pub struct WifiDriver<'d> {
     status: Arc<mutex::Mutex<WifiDriverStatus>>,
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    notification: Arc<Notification>,
     _subscription: EspSubscription<'static, System>,
     #[cfg(all(feature = "alloc", esp_idf_comp_nvs_flash_enabled))]
     _nvs: Option<EspDefaultNvsPartition>,
@@ -438,10 +451,19 @@ impl<'d> WifiDriver<'d> {
     ) -> Result<Self, EspError> {
         Self::init(nvs.is_some())?;
 
-        let (status, subscription) = Self::subscribe(&sysloop)?;
+        #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+        let notification = Arc::new(Notification::new());
+
+        let (status, subscription) = Self::subscribe(
+            &sysloop,
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            notification.clone(),
+        )?;
 
         Ok(Self {
             status,
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            notification,
             _subscription: subscription,
             _nvs: nvs,
             _p: PhantomData,
@@ -467,6 +489,7 @@ impl<'d> WifiDriver<'d> {
     #[allow(clippy::type_complexity)]
     fn subscribe(
         sysloop: &EspEventLoop<System>,
+        #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))] notifier: Arc<Notification>,
     ) -> Result<
         (
             Arc<mutex::Mutex<WifiDriverStatus>>,
@@ -491,7 +514,7 @@ impl<'d> WifiDriver<'d> {
                 WifiEvent::StaStarted => guard.sta = WifiStaStatus::Started,
                 WifiEvent::StaStopped => guard.sta = WifiStaStatus::Stopped,
                 WifiEvent::StaConnected => guard.sta = WifiStaStatus::Connected,
-                WifiEvent::StaDisconnected => guard.sta = WifiStaStatus::Started,
+                WifiEvent::StaDisconnected(_) => guard.sta = WifiStaStatus::Started,
                 WifiEvent::ScanDone => guard.scan = WifiScanStatus::Done,
                 WifiEvent::StaWpsSuccess(_)
                 | WifiEvent::StaWpsFailed
@@ -499,6 +522,13 @@ impl<'d> WifiDriver<'d> {
                 | WifiEvent::StaWpsPin(_)
                 | WifiEvent::StaWpsPbcOverlap => guard.wps = Some((&event).try_into().unwrap()),
                 _ => (),
+            };
+
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            {
+                drop(guard);
+
+                notifier.notify_lsb()
             };
         })?;
 
@@ -627,7 +657,7 @@ impl<'d> WifiDriver<'d> {
 
         Ok(())
     }
-    
+
     fn get_mode(&self) -> Result<wifi_mode_t, EspError> {
         let mut mode: wifi_mode_t = 0;
         esp!(unsafe { esp_wifi_get_mode(&mut mode) })?;
@@ -1174,7 +1204,7 @@ impl<'d> WifiDriver<'d> {
         let mode = self.get_mode()?;
 
         if self.is_sta_started().unwrap_or(false) {
-            let _ = self.disconnect();
+            self.disconnect()?;
         }
 
         let new_mode = if mode == wifi_mode_t_WIFI_MODE_APSTA {
@@ -1193,7 +1223,7 @@ impl<'d> WifiDriver<'d> {
         let current_config = self.get_sta_conf()?;
 
         if self.is_sta_started().unwrap_or(false) {
-            let _ = self.disconnect();
+            self.disconnect()?;
         }
 
         info!("Setting STA configuration: {:?}", conf);
@@ -1213,12 +1243,6 @@ impl<'d> WifiDriver<'d> {
         debug!("STA configuration done");
 
         Ok(())
-    }
-
-    pub fn get_ap_info(&self) -> Result<AccessPointInfo, EspError> {
-        let mut ap_info_raw = Default::default();
-        esp!(unsafe { esp_wifi_sta_get_ap_info(&mut ap_info_raw) })?;
-        Ok(Newtype(&ap_info_raw).into())
     }
 
     fn get_ap_conf(&self) -> Result<AccessPointConfiguration, EspError> {
@@ -1408,6 +1432,11 @@ impl<'d> NonBlocking for WifiDriver<'d> {
 
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         WifiDriver::is_wps_finished(self)
+    }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        &self.notification
     }
 }
 
@@ -1809,6 +1838,11 @@ impl<'d> NonBlocking for EspWifi<'d> {
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         EspWifi::is_wps_finished(self)
     }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        self.driver().notification()
+    }
 }
 
 #[cfg(esp_idf_comp_esp_netif_enabled)]
@@ -1969,6 +2003,158 @@ impl TryFrom<&WpsCredentialsRef> for WpsCredentials {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WifiReasonCode {
+    Unspecified,
+    AuthExpire,
+    AuthLeave,
+    AssocExpire,
+    AssocToomany,
+    NotAuthed,
+    NotAssoced,
+    AssocLeave,
+    AssocNotAuthed,
+    DisassocPwrcapBad,
+    DisassocSupchanBad,
+    BssTransitionDisassoc,
+    IeInvalid,
+    MicFailure,
+    FourWayHandshakeTimeout,
+    GroupKeyUpdateTimeout,
+    IeIn4wayDiffers,
+    GroupCipherInvalid,
+    PairwiseCipherInvalid,
+    AkmpInvalid,
+    UnsuppRsnIeVersion,
+    InvalidRsnIeCap,
+    AuthFailed8021x,
+    CipherSuiteRejected,
+    TdlsPeerUnreachable,
+    TdlsUnspecified,
+    SspRequestedDisassoc,
+    NoSspRoamingAgreement,
+    BadCipherOrAkm,
+    NotAuthorizedThisLocation,
+    ServiceChangePercludesTs,
+    UnspecifiedQos,
+    NotEnoughBandwidth,
+    MissingAcks,
+    ExceededTxop,
+    StaLeaving,
+    EndBa,
+    UnknownBa,
+    Timeout,
+    PeerInitiated,
+    ApInitiated,
+    InvalidFtActionFrameCount,
+    InvalidPmkid,
+    InvalidMde,
+    InvalidFte,
+    TransmissionLinkEstablishFailed,
+    AlterativeChannelOccupied,
+    BeaconTimeout,
+    NoApFound,
+    AuthFail,
+    AssocFail,
+    HandshakeTimeout,
+    ConnectionFail,
+    ApTsfReset,
+    Roaming,
+    AssocComebackTimeTooLong,
+}
+
+impl From<u32> for WifiReasonCode {
+    #[allow(non_upper_case_globals, non_snake_case, non_camel_case_types)]
+    fn from(value: u32) -> Self {
+        match value {
+            wifi_err_reason_t_WIFI_REASON_UNSPECIFIED => Self::Unspecified,
+            wifi_err_reason_t_WIFI_REASON_AUTH_EXPIRE => Self::AuthExpire,
+            wifi_err_reason_t_WIFI_REASON_AUTH_LEAVE => Self::AuthLeave,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_EXPIRE => Self::AssocExpire,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_TOOMANY => Self::AssocToomany,
+            wifi_err_reason_t_WIFI_REASON_NOT_AUTHED => Self::NotAuthed,
+            wifi_err_reason_t_WIFI_REASON_NOT_ASSOCED => Self::NotAssoced,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_LEAVE => Self::AssocLeave,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_NOT_AUTHED => Self::AssocNotAuthed,
+            wifi_err_reason_t_WIFI_REASON_DISASSOC_PWRCAP_BAD => Self::DisassocPwrcapBad,
+            wifi_err_reason_t_WIFI_REASON_DISASSOC_SUPCHAN_BAD => Self::DisassocSupchanBad,
+            wifi_err_reason_t_WIFI_REASON_BSS_TRANSITION_DISASSOC => Self::BssTransitionDisassoc,
+            wifi_err_reason_t_WIFI_REASON_IE_INVALID => Self::IeInvalid,
+            wifi_err_reason_t_WIFI_REASON_MIC_FAILURE => Self::MicFailure,
+            wifi_err_reason_t_WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT => Self::FourWayHandshakeTimeout,
+            wifi_err_reason_t_WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT => Self::GroupKeyUpdateTimeout,
+            wifi_err_reason_t_WIFI_REASON_IE_IN_4WAY_DIFFERS => Self::IeIn4wayDiffers,
+            wifi_err_reason_t_WIFI_REASON_GROUP_CIPHER_INVALID => Self::GroupCipherInvalid,
+            wifi_err_reason_t_WIFI_REASON_PAIRWISE_CIPHER_INVALID => Self::PairwiseCipherInvalid,
+            wifi_err_reason_t_WIFI_REASON_AKMP_INVALID => Self::AkmpInvalid,
+            wifi_err_reason_t_WIFI_REASON_UNSUPP_RSN_IE_VERSION => Self::UnsuppRsnIeVersion,
+            wifi_err_reason_t_WIFI_REASON_INVALID_RSN_IE_CAP => Self::InvalidRsnIeCap,
+            wifi_err_reason_t_WIFI_REASON_802_1X_AUTH_FAILED => Self::AuthFailed8021x,
+            wifi_err_reason_t_WIFI_REASON_CIPHER_SUITE_REJECTED => Self::CipherSuiteRejected,
+            wifi_err_reason_t_WIFI_REASON_TDLS_PEER_UNREACHABLE => Self::TdlsPeerUnreachable,
+            wifi_err_reason_t_WIFI_REASON_TDLS_UNSPECIFIED => Self::TdlsUnspecified,
+            wifi_err_reason_t_WIFI_REASON_SSP_REQUESTED_DISASSOC => Self::SspRequestedDisassoc,
+            wifi_err_reason_t_WIFI_REASON_NO_SSP_ROAMING_AGREEMENT => Self::NoSspRoamingAgreement,
+            wifi_err_reason_t_WIFI_REASON_BAD_CIPHER_OR_AKM => Self::BadCipherOrAkm,
+            wifi_err_reason_t_WIFI_REASON_NOT_AUTHORIZED_THIS_LOCATION => {
+                Self::NotAuthorizedThisLocation
+            }
+            wifi_err_reason_t_WIFI_REASON_SERVICE_CHANGE_PERCLUDES_TS => {
+                Self::ServiceChangePercludesTs
+            }
+            wifi_err_reason_t_WIFI_REASON_UNSPECIFIED_QOS => Self::UnspecifiedQos,
+            wifi_err_reason_t_WIFI_REASON_NOT_ENOUGH_BANDWIDTH => Self::NotEnoughBandwidth,
+            wifi_err_reason_t_WIFI_REASON_MISSING_ACKS => Self::MissingAcks,
+            wifi_err_reason_t_WIFI_REASON_EXCEEDED_TXOP => Self::ExceededTxop,
+            wifi_err_reason_t_WIFI_REASON_STA_LEAVING => Self::StaLeaving,
+            wifi_err_reason_t_WIFI_REASON_END_BA => Self::EndBa,
+            wifi_err_reason_t_WIFI_REASON_UNKNOWN_BA => Self::UnknownBa,
+            wifi_err_reason_t_WIFI_REASON_TIMEOUT => Self::Timeout,
+            wifi_err_reason_t_WIFI_REASON_PEER_INITIATED => Self::PeerInitiated,
+            wifi_err_reason_t_WIFI_REASON_AP_INITIATED => Self::ApInitiated,
+            wifi_err_reason_t_WIFI_REASON_INVALID_FT_ACTION_FRAME_COUNT => {
+                Self::InvalidFtActionFrameCount
+            }
+            wifi_err_reason_t_WIFI_REASON_INVALID_PMKID => Self::InvalidPmkid,
+            wifi_err_reason_t_WIFI_REASON_INVALID_MDE => Self::InvalidMde,
+            wifi_err_reason_t_WIFI_REASON_INVALID_FTE => Self::InvalidFte,
+            wifi_err_reason_t_WIFI_REASON_TRANSMISSION_LINK_ESTABLISH_FAILED => {
+                Self::TransmissionLinkEstablishFailed
+            }
+            wifi_err_reason_t_WIFI_REASON_ALTERATIVE_CHANNEL_OCCUPIED => {
+                Self::AlterativeChannelOccupied
+            }
+            wifi_err_reason_t_WIFI_REASON_BEACON_TIMEOUT => Self::BeaconTimeout,
+            wifi_err_reason_t_WIFI_REASON_NO_AP_FOUND => Self::NoApFound,
+            wifi_err_reason_t_WIFI_REASON_AUTH_FAIL => Self::AuthFail,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_FAIL => Self::AssocFail,
+            wifi_err_reason_t_WIFI_REASON_HANDSHAKE_TIMEOUT => Self::HandshakeTimeout,
+            wifi_err_reason_t_WIFI_REASON_CONNECTION_FAIL => Self::ConnectionFail,
+            wifi_err_reason_t_WIFI_REASON_AP_TSF_RESET => Self::ApTsfReset,
+            wifi_err_reason_t_WIFI_REASON_ROAMING => Self::Roaming,
+            wifi_err_reason_t_WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG => {
+                Self::AssocComebackTimeTooLong
+            }
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StaDisconnectedData {
+    pub reason: WifiReasonCode,
+    pub rssi: i8,
+}
+
+impl From<wifi_event_sta_disconnected_t> for StaDisconnectedData {
+    fn from(value: wifi_event_sta_disconnected_t) -> Self {
+        Self {
+            reason: (value.reason as u32).into(),
+            rssi: value.rssi,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum WifiEvent<'a> {
     Ready,
@@ -2027,7 +2213,17 @@ impl<'a> EspEventDeserializer for WifiEvent<'a> {
             wifi_event_t_WIFI_EVENT_STA_START => WifiEvent::StaStarted,
             wifi_event_t_WIFI_EVENT_STA_STOP => WifiEvent::StaStopped,
             wifi_event_t_WIFI_EVENT_STA_CONNECTED => WifiEvent::StaConnected,
-            wifi_event_t_WIFI_EVENT_STA_DISCONNECTED => WifiEvent::StaDisconnected,
+            wifi_event_t_WIFI_EVENT_STA_DISCONNECTED => {
+                let evt_data: Option<StaDisconnectedData> = data.payload.and_then(|payload| {
+                    let data = unsafe {
+                        (payload as *const _ as *const wifi_event_sta_disconnected_t)
+                            .as_ref()
+                            .copied()
+                    };
+                    data.map(Into::into)
+                });
+                WifiEvent::StaDisconnected(evt_data.into())
+            }
             wifi_event_t_WIFI_EVENT_STA_AUTHMODE_CHANGE => WifiEvent::StaAuthmodeChanged,
             wifi_event_t_WIFI_EVENT_STA_WPS_ER_SUCCESS => {
                 let payload = unsafe {
@@ -2456,12 +2652,11 @@ where
         mut matcher: F,
         timeout: Option<Duration>,
     ) -> Result<(), EspError> {
-        let mut wait = crate::eventloop::AsyncWait::<WifiEvent, _>::new(
-            &self.event_loop,
-            &self.timer_service,
-        )?;
+        let notification = self.wifi.notification().clone();
+        let mut timer = self.timer_service.timer_async()?;
 
-        wait.wait_while(|| matcher(self), timeout).await
+        crate::eventloop::wait_while_impl(&mut timer, &notification, || matcher(self), timeout)
+            .await
     }
 
     /// Start WPS and perform a wait asynchronously until it connects, fails or

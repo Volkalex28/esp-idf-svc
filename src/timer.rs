@@ -390,7 +390,7 @@ pub mod embassy_time_driver {
 
         #[allow(clippy::mut_from_ref)]
         fn alarm(&self, id: u8) -> &mut Alarm {
-            &mut unsafe { (*self.alarms.get())[id as usize] }
+            unsafe { &mut (*self.alarms.get())[id as usize] }
         }
     }
 
@@ -406,7 +406,7 @@ pub mod embassy_time_driver {
             let id = {
                 let _guard = self.cs.enter();
 
-                let id = (*self.alarms.get()).len() as u8;
+                let id = (*self.alarms.get()).len();
 
                 if id < MAX_ALARMS {
                     (*self.alarms.get())
