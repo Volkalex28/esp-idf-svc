@@ -14,6 +14,9 @@ use enumset::*;
 
 use embedded_svc::wifi::Wifi;
 
+#[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+use esp_idf_hal::task::asynch::Notification;
+
 use crate::hal::modem::WifiModemPeripheral;
 use crate::hal::peripheral::Peripheral;
 
@@ -396,6 +399,9 @@ pub trait NonBlocking {
     fn stop_wps(&mut self) -> Result<WpsStatus, EspError>;
 
     fn is_wps_finished(&self) -> Result<bool, EspError>;
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification>;
 }
 
 impl<T> NonBlocking for &mut T
@@ -440,6 +446,11 @@ where
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         (**self).is_wps_finished()
     }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        (**self).notification()
+    }
 }
 
 /// This struct provides a safe wrapper over the ESP IDF Wifi C driver. The driver
@@ -451,6 +462,8 @@ where
 /// only when one would like to utilize a custom, non-STD network stack like `smoltcp`.
 pub struct WifiDriver<'d> {
     status: Arc<mutex::Mutex<WifiDriverStatus>>,
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    notification: Arc<Notification>,
     _subscription: EspSubscription<'static, System>,
     #[cfg(all(feature = "alloc", esp_idf_comp_nvs_flash_enabled))]
     _nvs: Option<EspDefaultNvsPartition>,
@@ -474,10 +487,19 @@ impl<'d> WifiDriver<'d> {
     ) -> Result<Self, EspError> {
         Self::init(nvs.is_some())?;
 
-        let (status, subscription) = Self::subscribe(&sysloop)?;
+        #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+        let notification = Arc::new(Notification::new());
+
+        let (status, subscription) = Self::subscribe(
+            &sysloop,
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            notification.clone(),
+        )?;
 
         Ok(Self {
             status,
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            notification,
             _subscription: subscription,
             _nvs: nvs,
             _p: PhantomData,
@@ -503,6 +525,7 @@ impl<'d> WifiDriver<'d> {
     #[allow(clippy::type_complexity)]
     fn subscribe(
         sysloop: &EspEventLoop<System>,
+        #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))] notifier: Arc<Notification>,
     ) -> Result<
         (
             Arc<mutex::Mutex<WifiDriverStatus>>,
@@ -535,6 +558,13 @@ impl<'d> WifiDriver<'d> {
                 | WifiEvent::StaWpsPin(_)
                 | WifiEvent::StaWpsPbcOverlap => guard.wps = Some((&event).try_into().unwrap()),
                 _ => (),
+            };
+
+            #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+            {
+                drop(guard);
+
+                notifier.notify_lsb()
             };
         })?;
 
@@ -1209,7 +1239,7 @@ impl<'d> WifiDriver<'d> {
         let mode = self.get_mode()?;
 
         if self.is_sta_started().unwrap_or(false) {
-            let _ = self.disconnect();
+            self.disconnect()?;
         }
 
         let new_mode = if mode == wifi_mode_t_WIFI_MODE_APSTA {
@@ -1228,7 +1258,7 @@ impl<'d> WifiDriver<'d> {
         let current_config = self.get_sta_conf()?;
 
         if self.is_sta_started().unwrap_or(false) {
-            let _ = self.disconnect();
+            self.disconnect()?;
         }
 
         info!("Setting STA configuration: {:?}", conf);
@@ -1432,6 +1462,11 @@ impl<'d> NonBlocking for WifiDriver<'d> {
 
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         WifiDriver::is_wps_finished(self)
+    }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        &self.notification
     }
 }
 
@@ -1889,6 +1924,11 @@ impl<'d> NonBlocking for EspWifi<'d> {
 
     fn is_wps_finished(&self) -> Result<bool, EspError> {
         EspWifi::is_wps_finished(self)
+    }
+
+    #[cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))]
+    fn notification(&self) -> &Arc<Notification> {
+        self.driver().notification()
     }
 }
 
@@ -2798,12 +2838,11 @@ where
         mut matcher: F,
         timeout: Option<Duration>,
     ) -> Result<(), EspError> {
-        let mut wait = crate::eventloop::AsyncWait::<WifiEvent, _>::new(
-            &self.event_loop,
-            &self.timer_service,
-        )?;
+        let notification = self.wifi.notification().clone();
+        let mut timer = self.timer_service.timer_async()?;
 
-        wait.wait_while(|| matcher(self), timeout).await
+        crate::eventloop::wait_while_impl(&mut timer, &notification, || matcher(self), timeout)
+            .await
     }
 
     /// Start WPS and perform a wait asynchronously until it connects, fails or

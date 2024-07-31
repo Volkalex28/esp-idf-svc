@@ -573,7 +573,11 @@ where
         let sender = QuitOnDrop::new(channel);
 
         let subscription = self.subscribe::<EspEvent, _>(move |event| {
-            let mut event = unsafe { mem::transmute::<EspEvent<'_>, EspEvent<'_>>(event) };
+            let mut event: EspEvent<'_> = unsafe { core::mem::transmute(event) };
+
+            if D::source().is_some_and(|source| source != event.source) {
+                return;
+            }
 
             sender.channel().share(&mut event);
         })?;
@@ -943,43 +947,53 @@ mod async_wait {
 
         pub async fn wait_while<F: FnMut() -> Result<bool, EspError>>(
             &mut self,
-            mut matcher: F,
+            matcher: F,
             duration: Option<Duration>,
         ) -> Result<(), EspError> {
             let notification = &self.notification;
 
-            let subscription_wait = pin!(async move {
-                while matcher()? {
-                    notification.wait().await;
-                }
+            wait_while_impl(&mut self.timer, notification, matcher, duration).await
+        }
+    }
 
-                Result::<(), EspError>::Ok(())
-            });
-
-            if let Some(duration) = duration {
-                debug!("About to wait for duration {:?}", duration);
-
-                let timer_wait = self.timer.after(duration);
-
-                match embassy_futures::select::select(subscription_wait, timer_wait).await {
-                    embassy_futures::select::Either::First(_) => {
-                        debug!("Waiting done - success");
-                        Ok(())
-                    }
-                    embassy_futures::select::Either::Second(_) => {
-                        debug!("Timeout while waiting");
-                        esp!(ESP_ERR_TIMEOUT)
-                    }
-                }
-            } else {
-                debug!("About to wait");
-
-                subscription_wait.await?;
-
-                debug!("Waiting done - success");
-
-                Ok(())
+    pub(crate) async fn wait_while_impl<F: FnMut() -> Result<bool, EspError>>(
+        timer: &mut EspAsyncTimer,
+        notification: &Arc<Notification>,
+        mut matcher: F,
+        duration: Option<Duration>,
+    ) -> Result<(), EspError> {
+        notification.reset();
+        let subscription_wait = pin!(async move {
+            while matcher()? {
+                notification.wait().await;
             }
+
+            Result::<(), EspError>::Ok(())
+        });
+
+        if let Some(duration) = duration {
+            debug!("About to wait for duration {:?}", duration);
+
+            let timer_wait = timer.after(duration);
+
+            match embassy_futures::select::select(subscription_wait, timer_wait).await {
+                embassy_futures::select::Either::First(_) => {
+                    debug!("Waiting done - success");
+                    Ok(())
+                }
+                embassy_futures::select::Either::Second(_) => {
+                    debug!("Timeout while waiting");
+                    esp!(ESP_ERR_TIMEOUT)
+                }
+            }
+        } else {
+            debug!("About to wait");
+
+            subscription_wait.await?;
+
+            debug!("Waiting done - success");
+
+            Ok(())
         }
     }
 }
